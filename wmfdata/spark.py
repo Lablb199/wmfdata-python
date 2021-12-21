@@ -1,10 +1,16 @@
-from threading import Timer
-import warnings
 import os
+from pathlib import Path
+from threading import Timer
+import uuid
+import warnings
 
 import findspark
 
-from wmfdata import conda
+from wmfdata import (
+    conda,
+    hdfs
+)
+
 from wmfdata.utils import (
     check_kerberos_auth,
     ensure_list,
@@ -171,7 +177,13 @@ def get_custom_session(
     for k, v in spark_config.items():
         builder.config(k, v)
 
-    return builder.getOrCreate()
+    session = builder.getOrCreate()
+
+    # Since it's possible that an existing session with a timeout set is
+    # being returned, clear any timeout.
+    cancel_session_timeout(session)
+
+    return session
 
 def get_session(
     type="yarn-regular",
@@ -331,10 +343,47 @@ def run(commands, format="pandas", session_type="yarn-regular", extra_settings={
         elif format == "raw":
             overall_result = overall_result.collect()
 
-    # (re)start a timeout on SparkSessions in Yarn after the result is collected.
-    # A SparkSession used by this run function
-    # will timeout after 5 minutes, unless used again.
     if PREDEFINED_SPARK_SESSIONS[session_type]["master"] == "yarn":
-        start_session_timeout(spark_session, 3600)
+        start_session_timeout(spark_session)
 
     return overall_result
+
+def load_parquet(local_path, hive_db, hive_table=None, overwrite=False):
+    """
+    Loads a Parquet file into the Data Lake and registers it as a Hive table.
+
+    Arguments:
+    * `local_path`: the path (relative or absolute) to the file you want to load
+    * `hive_db`: the Hive database into which to place the loaded data. Must
+      already exist.
+    * `hive_table` (optional): the Hive table name to use for the loaded data.
+      If not given, the local file name is used (e.g. "experiment_data"
+      for "/dir/experiment_data.parquet").
+    * `overwrite` (optional): whether to overwrite the specified Hive table
+      if it already exists.
+    """
+    
+    session = get_session()
+
+    local_path = Path(local_path)
+    if not hive_table:
+        hive_table = local_path.stem
+
+    # Reading from HDFS works with both YARN and local sessions, while reading
+    # from the local filesystem only works with local sessions.
+    random_string = uuid.uuid4()
+    hdfs_path = f"hdfs:///tmp/{random_string}-{hive_table}"
+    hdfs.put(local_path.resolve(), hdfs_path)
+    df = session.read.parquet(hdfs_path)
+
+    df_writer = df.write
+    # By default, the writer raises an error if the table already exists
+    if overwrite:
+        df_writer.mode("overwrite")
+    df_writer.saveAsTable(f"{hive_db}.{hive_table}")
+
+    # Since we created a "managed" Hive table, Hive has copied the data to its
+    # own HDFS directory. We can delete our temporary copy.
+    hdfs.delete(hdfs_path)
+
+    start_session_timeout(session)
